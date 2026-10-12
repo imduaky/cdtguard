@@ -1,0 +1,39 @@
+name: cdtguard
+arch: ${GOARCH}
+platform: linux
+version: ${VERSION}
+section: admin
+priority: optional
+maintainer: Young <young@qeee.net>
+description: Monthly traffic guard for Aliyun CDT servers; runs a command (default shutdown) at the limit.
+homepage: https://github.com/imduaky/cdtguard
+license: MIT
+contents:
+  - src: dist/cdtguard-${GOARCH}
+    dst: /usr/bin/cdtguard
+    file_info: {mode: 0755}
+  # systemd (deb)
+  - src: packaging/cdtguard.service
+    dst: /lib/systemd/system/cdtguard.service
+    packager: deb
+  - src: packaging/cdtguard.default
+    dst: /etc/default/cdtguard
+    type: config|noreplace
+    packager: deb
+  # OpenRC (apk / Alpine has no systemd)
+  - src: packaging/cdtguard.openrc
+    dst: /etc/init.d/cdtguard
+    file_info: {mode: 0755}
+    packager: apk
+  - src: packaging/cdtguard.confd
+    dst: /etc/conf.d/cdtguard
+    type: config|noreplace
+    packager: apk
+  - dst: /var/lib/cdtguard
+    type: dir
+    file_info: {mode: 0755}
+overrides:
+  deb:
+    scripts:
+      postinstall: packaging/deb/postinst.sh
+      preremove: packaging/deb/prerm.sh

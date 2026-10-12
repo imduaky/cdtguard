@@ -1,0 +1,37 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test ./...
+      - name: Install nfpm
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+      - name: Build binaries and packages
+        run: |
+          export VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            export GOARCH=$arch
+            CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o dist/cdtguard-$arch ./cmd/cdtguard
+            nfpm package -f packaging/nfpm.yaml -p deb -t dist/
+            nfpm package -f packaging/nfpm.yaml -p apk -t dist/
+          done
+          cd dist && sha256sum *.deb *.apk cdtguard-* > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.deb
+            dist/*.apk
+            dist/cdtguard-*
+            dist/SHA256SUMS

@@ -1,0 +1,11 @@
+#!/sbin/openrc-run
+description="CDTGuard - monthly traffic guard"
+command="/usr/bin/cdtguard"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/cdtguard.log"
+error_log="/var/log/cdtguard.log"
+
+depend() {
+	need net
+}

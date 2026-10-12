@@ -1,0 +1,8 @@
+# Flags for `cdtguard run` (see `cdtguard run -h`). systemd splits this value on
+# whitespace WITHOUT quote handling, so only use single-word values here:
+#   CDTGUARD_ARGS="-iface eth0 -limit 180G -cmd poweroff"
+# For a command containing spaces, override ExecStart: `systemctl edit cdtguard`
+#   [Service]
+#   ExecStart=
+#   ExecStart=/usr/bin/cdtguard run -limit 180G -cmd "systemctl poweroff"
+CDTGUARD_ARGS="-limit 195G"
