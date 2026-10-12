@@ -44,13 +44,6 @@ func Usage(mode string, rx, tx uint64) uint64 {
 	return max(rx, tx)
 }
 
-func sub(a, b uint64) uint64 {
-	if b >= a {
-		return 0
-	}
-	return a - b
-}
-
 // Guard holds configuration and the in-memory state. Injectable fields keep it testable.
 type Guard struct {
 	StatePath  string
@@ -97,7 +90,8 @@ func (g *Guard) Init() (alreadyFired bool, err error) {
 	switch {
 	case err == nil:
 		g.st = st
-		g.advance(now, rx, tx)
+		// A reboot can only happen between runs, so only check for one here.
+		g.advance(now, rx, tx, st.SavedAt < g.Boot.Unix())
 		g.logf("loaded state: used %s in cycle since %s", size.Format(g.used()), time.Unix(g.st.PeriodStart, 0).In(beijing).Format("2006-01-02 15:04"))
 	case os.IsNotExist(err) || errors.Is(err, state.ErrCorrupt):
 		if !os.IsNotExist(err) {
@@ -148,23 +142,25 @@ func (g *Guard) FiredAt() time.Time {
 	return time.Unix(g.st.FiredAt, 0)
 }
 
-// advance folds the counter readings into the state, handling cycle rollover and reboots.
-func (g *Guard) advance(now time.Time, rx, tx uint64) {
+// advance folds the counter readings into the state, handling cycle rollover and
+// reboots. rebooted says the counters restarted from 0 since the last save.
+func (g *Guard) advance(now time.Time, rx, tx uint64, rebooted bool) {
 	s := g.st
-	if cs := CycleStart(now).Unix(); s.PeriodStart != cs {
-		// New billing cycle: quota was reset, so is our accounting.
+	incRx, incTx := rx-s.LastRx, tx-s.LastTx
+	if rebooted || rx < s.LastRx || tx < s.LastTx {
+		incRx, incTx = rx, tx
+	}
+	// Only ever roll forward: a clock stepped backwards (NTP after boot, VM time
+	// sync) must not reset the usage or re-arm the action.
+	if cs := CycleStart(now).Unix(); cs > s.PeriodStart {
+		// New billing cycle: quota was reset, so is our accounting. Traffic since
+		// the last sample may predate the reset; counting it here errs on the safe side.
 		g.pendingReset = g.pendingReset || s.FiredAt != 0
-		s.PeriodStart, s.FiredAt, s.Rx, s.Tx = cs, 0, 0, 0
-		if g.Boot.Unix() >= cs {
-			s.Rx, s.Tx = rx, tx // counters began at 0 after the reset, all of it counts
-		}
+		s.PeriodStart, s.FiredAt, s.Rx, s.Tx = cs, 0, incRx, incTx
 		g.logf("new billing cycle started, usage reset")
-	} else if s.SavedAt < g.Boot.Unix() || rx < s.LastRx || tx < s.LastTx {
-		s.Rx += rx // rebooted since last save: counters restarted from 0
-		s.Tx += tx
 	} else {
-		s.Rx += rx - s.LastRx
-		s.Tx += tx - s.LastTx
+		s.Rx += incRx
+		s.Tx += incTx
 	}
 	s.LastRx, s.LastTx, s.SavedAt = rx, tx, now.Unix()
 }
@@ -177,7 +173,7 @@ func (g *Guard) Step(fire bool) error {
 		return err
 	}
 	now := g.now()
-	g.advance(now, rx, tx)
+	g.advance(now, rx, tx, false)
 
 	if g.pendingReset {
 		g.pendingReset = false
@@ -198,6 +194,13 @@ func (g *Guard) Step(fire bool) error {
 	}
 	g.logf("limit reached (%s >= %s), running: %s", size.Format(g.used()), size.Format(g.Limit), g.Command)
 	if err := g.exec(g.Command); err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && !ee.Exited() {
+			// Killed by a signal: most likely systemd is stopping us (and the
+			// command) because the command is shutting the system down.
+			g.logf("action terminated by %v; treating it as executed", err)
+			return nil
+		}
 		// The command itself failed, so nothing was shut down; allow a retry.
 		g.st.FiredAt = 0
 		_ = state.Save(g.StatePath, g.st)

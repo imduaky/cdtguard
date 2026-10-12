@@ -12,10 +12,4 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go vet ./...
-      - run: go test -race ./...
-      - name: Cross build
-        run: |
-          for arch in amd64 arm64; do
-            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags "-s -w" -o /dev/null ./cmd/cdtguard
-          done
+      - run: make ci

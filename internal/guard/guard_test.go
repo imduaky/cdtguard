@@ -2,6 +2,7 @@ package guard
 
 import (
 	"errors"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -57,6 +58,13 @@ func newEnv(t *testing.T, boot time.Time) *env {
 		Exec:      func(c string) error { e.execs = append(e.execs, c); return e.execErr },
 	}
 	return e
+}
+
+// restart simulates a new cdtguard process (same config, fresh memory) after a boot.
+func (e *env) restart(boot time.Time) {
+	g := *e.g
+	g.st, g.pendingReset, g.Boot = nil, false, boot
+	e.g = &g
 }
 
 func TestFreshStartUsesCounters(t *testing.T) {
@@ -132,10 +140,10 @@ func TestRebootAndFireOnce(t *testing.T) {
 		t.Fatalf("used=%d execs=%v", e.g.used(), e.execs)
 	}
 
-	// Reboot: boot is after last save, counters restarted -> added in full.
-	e.g.Boot = e.now.Add(time.Minute)
+	// Reboot: new process, boot is after last save -> counters added in full.
+	e.restart(e.now.Add(time.Minute))
 	e.now, e.tx = e.now.Add(2*time.Minute), 5
-	e.g.Step(true)
+	e.g.Init()
 	if e.g.used() != 75 {
 		t.Fatalf("after reboot used=%d", e.g.used())
 	}
@@ -163,19 +171,16 @@ func TestPowerOnAfterFireDoesNotFireAgain(t *testing.T) {
 
 	// User powers the server back on from the console: new process, new boot.
 	e.now = e.now.Add(time.Hour)
-	g2 := *e.g
-	g2.st = nil
-	g2.Boot = e.now
-	g2.RestoreCmd = "restore"
+	e.restart(e.now)
 	e.tx = 3
-	fired, err := g2.Init()
+	fired, err := e.g.Init()
 	if err != nil || !fired {
 		t.Fatalf("fired=%v err=%v", fired, err)
 	}
-	if g2.used() != 123 {
-		t.Errorf("used=%d", g2.used())
+	if e.g.used() != 123 {
+		t.Errorf("used=%d", e.g.used())
 	}
-	g2.Step(true)
+	e.g.Step(true)
 	if len(e.execs) != 1 {
 		t.Fatal("must not fire again this cycle")
 	}
@@ -190,7 +195,7 @@ func TestMonthlyResetRunsResetCmd(t *testing.T) {
 
 	e.now, e.tx = ts(2026, 11, 1, 12).Add(time.Minute), 130
 	e.g.Step(true)
-	if e.g.used() != 0 || e.g.st.FiredAt != 0 {
+	if e.g.used() != 10 || e.g.st.FiredAt != 0 { // the 10 bytes since the last sample count in November
 		t.Fatalf("not reset: %+v", e.g.st)
 	}
 	if len(e.execs) != 2 || e.execs[1] != "unthrottle" {
@@ -219,5 +224,80 @@ func TestFailedCommandAllowsRetry(t *testing.T) {
 	e.g.Step(true)
 	if len(e.execs) != 2 {
 		t.Errorf("execs=%v", e.execs)
+	}
+}
+
+func TestClockGoingBackwardsDoesNotResetCycle(t *testing.T) {
+	e := newEnv(t, bootThisCycle)
+	e.g.Init()
+	e.now, e.tx = ts(2026, 11, 1, 12).Add(time.Minute), 10
+	e.g.Step(true) // rolls into the November cycle
+	e.tx = 150
+	e.g.Step(true)
+	if len(e.execs) != 1 {
+		t.Fatalf("setup: execs=%v", e.execs)
+	}
+	// NTP steps the clock back into October.
+	e.now, e.tx = ts(2026, 10, 12, 0), 160
+	e.g.Step(true)
+	if e.g.st.PeriodStart != CycleStart(ts(2026, 11, 2, 0)).Unix() || e.g.st.FiredAt == 0 || e.g.used() < 100 {
+		t.Fatalf("cycle was reset by a backwards clock: %+v", e.g.st)
+	}
+	if len(e.execs) != 1 {
+		t.Fatalf("fired again: %v", e.execs)
+	}
+}
+
+func TestSignalKilledActionCountsAsFired(t *testing.T) {
+	e := newEnv(t, bootThisCycle)
+	e.g.Init()
+	// systemd stops the service while the action (e.g. a script ending in
+	// shutdown) is still running: the child dies from SIGTERM.
+	e.g.Exec = func(string) error { return exec.Command("sh", "-c", "kill -TERM $$").Run() }
+	e.tx = 120
+	if err := e.g.Step(true); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := state.Load(e.g.StatePath); st.FiredAt == 0 {
+		t.Fatal("signal-killed action must stay marked as fired")
+	}
+}
+
+func TestClockBeforeBootWhileRunningDoesNotDoubleCount(t *testing.T) {
+	e := newEnv(t, ts(2026, 10, 12, 0))
+	e.now = e.g.Boot.Add(10 * time.Second)
+	e.tx = 10
+	e.g.Init()
+	// NTP steps the clock back to before the boot time we read at startup.
+	for i := 1; i <= 3; i++ {
+		e.now, e.tx = e.g.Boot.Add(-time.Hour+time.Duration(i)*time.Minute), 10+uint64(i)
+		e.g.Step(true)
+	}
+	if e.g.used() != 13 {
+		t.Fatalf("used = %d, want 13 (counter must not be re-added as if rebooted)", e.g.used())
+	}
+}
+
+func TestRolloverWhileStopped(t *testing.T) {
+	// Daemon stopped (no reboot) across the reset: traffic since the last save
+	// counts in the new cycle.
+	e := newEnv(t, bootOld)
+	e.tx = 50
+	if err := state.Save(e.g.StatePath, SeedState(e.now, "max", 0, e.tx, 60)); err != nil {
+		t.Fatal(err)
+	}
+	e.now, e.tx = ts(2026, 11, 2, 0), 70
+	e.restart(bootOld)
+	e.g.Init()
+	if e.g.used() != 20 {
+		t.Errorf("used = %d, want 20", e.g.used())
+	}
+
+	// Rebooted after the reset: everything since boot counts.
+	e.now, e.tx = ts(2026, 12, 2, 0), 30
+	e.restart(ts(2026, 12, 1, 13))
+	e.g.Init()
+	if e.g.used() != 30 {
+		t.Errorf("used = %d, want 30", e.g.used())
 	}
 }

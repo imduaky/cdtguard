@@ -9,12 +9,12 @@ description: Monthly traffic guard for Aliyun CDT servers; runs a command (defau
 homepage: https://github.com/imduaky/cdtguard
 license: MIT
 contents:
-  - src: dist/cdtguard-${GOARCH}
+  - src: build/cdtguard
     dst: /usr/bin/cdtguard
     file_info: {mode: 0755}
   # systemd (deb)
   - src: packaging/cdtguard.service
-    dst: /lib/systemd/system/cdtguard.service
+    dst: /usr/lib/systemd/system/cdtguard.service
     packager: deb
   - src: packaging/cdtguard.default
     dst: /etc/default/cdtguard

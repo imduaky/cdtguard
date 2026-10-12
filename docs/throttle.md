@@ -27,6 +27,7 @@ off() {
 	tc qdisc del dev "$IF" root 2>/dev/null
 	tc qdisc del dev "$IF" ingress 2>/dev/null
 	ip link del "$IFB" 2>/dev/null
+	return 0
 }
 
 case "$1" in

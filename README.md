@@ -38,8 +38,8 @@ Shared flags: `-state` (default `/var/lib/cdtguard/state.bin`), `-limit` (`195G`
   ```
   `init` also works at any other time to correct the counter (stop the daemon first); it overwrites the state file.
 - **State file exists**: if the server rebooted since the last save, the whole current counter is added to the stored total; otherwise only the delta.
-- **Fired once per cycle**: "fired" is written to disk *before* the command runs. If you power the server back on from the console after a shutdown, cdtguard logs a notice that the action already ran this month and will **not** run again until the next reset. If the command itself fails, it is retried.
-- **Monthly reset**: on the 1st at 12:00 (UTC+8) usage and the fired flag are cleared.
+- **Fired once per cycle**: "fired" is written to disk *before* the command runs. If you power the server back on from the console after a shutdown, cdtguard logs a notice that the action already ran this month and will **not** run again until the next reset. If the command exits with an error it is retried on the next sample; if it is killed by a signal (systemd stopping the service because the system is going down) it counts as executed.
+- **Monthly reset**: on the 1st at 12:00 (UTC+8) usage and the fired flag are cleared. Traffic from the last sample before the reset is counted in the new month (errs on the safe side). The cycle only moves forward, so a clock stepped backwards never resets it.
 
 Want a speed limit (CAKE) instead of a shutdown? See [docs/throttle.md](docs/throttle.md).
 
@@ -60,8 +60,12 @@ Check: `cdtguard status`, `journalctl -u cdtguard`.
 ## Build / release
 
 ```bash
-go test ./...
-CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o cdtguard ./cmd/cdtguard
+make help        # list targets
+make ci          # gofmt check, vet, race tests, cross-build (what CI runs)
+make tools       # install nfpm (needed for packages)
+make packages    # dist/*.deb and dist/*.apk for amd64 + arm64
+make release VERSION=1.2.3   # ci + packages + SHA256SUMS
+make clean
 ```
 
-Pushing a `v*` tag builds binaries and packages with [nfpm](https://nfpm.goreleaser.com) and attaches them to a GitHub release (`.github/workflows/release.yml`).
+Pushing a `v*` tag runs `make release` in GitHub Actions and attaches the files in `dist/` to a release (`.github/workflows/release.yml`).
