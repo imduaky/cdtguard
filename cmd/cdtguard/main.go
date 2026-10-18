@@ -19,6 +19,9 @@ import (
 
 var version = "dev"
 
+// cst is Beijing time, which Aliyun bills in.
+var cst = time.FixedZone("CST", 8*3600)
+
 const usage = `cdtguard - monthly traffic guard for Aliyun CDT
 
 Usage:
@@ -163,7 +166,8 @@ func initCmd(args []string) {
 	if err != nil {
 		log.Fatalf("read counters: %v", err)
 	}
-	if err := state.Save(c.state, guard.SeedState(time.Now(), c.mode, rx, tx, used)); err != nil {
+	prev, _ := state.Load(c.state) // keep its traffic history, if readable
+	if err := state.Save(c.state, guard.SeedState(time.Now(), c.mode, rx, tx, used, prev)); err != nil {
 		log.Fatalf("write state: %v", err)
 	}
 	fmt.Printf("state written to %s: used %s / %s (iface %s). Start the daemon now.\n", c.state, size.Format(used), size.Format(limit), c.iface)
@@ -180,11 +184,68 @@ func statusCmd(args []string) {
 	}
 	used := guard.Usage(c.mode, st.Rx, st.Tx)
 	fmt.Printf("used:    %s / %s (%.1f%%)  [rx %s, tx %s, mode %s]\n", size.Format(used), size.Format(limit), float64(used)*100/float64(limit), size.Format(st.Rx), size.Format(st.Tx), c.mode)
-	fmt.Printf("cycle:   since %s\n", time.Unix(st.PeriodStart, 0).In(time.FixedZone("CST", 8*3600)).Format("2006-01-02 15:04 MST"))
+	fmt.Printf("cycle:   since %s\n", time.Unix(st.PeriodStart, 0).In(cst).Format("2006-01-02 15:04 MST"))
 	fmt.Printf("updated: %s\n", time.Unix(st.SavedAt, 0).Format(time.DateTime))
 	if st.FiredAt != 0 {
 		fmt.Printf("fired:   %s (will not run again this cycle)\n", time.Unix(st.FiredAt, 0).Format(time.DateTime))
 	} else {
 		fmt.Println("fired:   no")
+	}
+	printDaily(st)
+	printHourly(st)
+	printHistory(st, c.mode)
+}
+
+func row(label string, rx, tx uint64, extra ...string) {
+	fmt.Printf("  %-18s %10s %10s", label, size.Format(rx), size.Format(tx))
+	for _, e := range extra {
+		fmt.Printf("  %s", e)
+	}
+	fmt.Println()
+}
+
+func printDaily(st *state.State) {
+	fmt.Printf("\n%-20s %10s %10s\n", "daily (CST)", "rx", "tx")
+	start := time.Unix(st.PeriodStart, 0).In(cst)
+	var sum state.Traffic
+	for i := range guard.DayIndex(st.PeriodStart, time.Unix(st.SavedAt, 0)) + 1 {
+		d := st.Daily[i]
+		sum.Add(d.Rx, d.Tx)
+		row(start.AddDate(0, 0, i).Format("01-02 Mon"), d.Rx, d.Tx)
+	}
+	// Counted before per-day tracking began (NIC counters at first start, `init`, older version).
+	if rx, tx := st.Rx-min(sum.Rx, st.Rx), st.Tx-min(sum.Tx, st.Tx); rx|tx != 0 {
+		row("untracked", rx, tx, "(no per-day data)")
+	}
+}
+
+func printHourly(st *state.State) {
+	if st.LastHour == 0 {
+		return
+	}
+	fmt.Printf("\n%-20s %10s %10s\n", "last 48 hours (CST)", "rx", "tx")
+	started := false // skip the empty hours before tracking began
+	for h := st.LastHour - state.Hours + 1; h <= st.LastHour; h++ {
+		t := st.Hourly[h%state.Hours]
+		if started = started || t != (state.Traffic{}); started {
+			row(time.Unix(h*3600, 0).In(cst).Format("01-02 15:00"), t.Rx, t.Tx)
+		}
+	}
+}
+
+func printHistory(st *state.State, mode string) {
+	if st.History[0].Start == 0 {
+		return
+	}
+	fmt.Printf("\n%-20s %10s %10s  %10s  %s\n", "past cycles (CST)", "rx", "tx", "used", "fired")
+	for _, c := range st.History {
+		if c.Start == 0 {
+			break
+		}
+		fired := "-"
+		if c.FiredAt != 0 {
+			fired = time.Unix(c.FiredAt, 0).In(cst).Format("01-02 15:04")
+		}
+		row(time.Unix(c.Start, 0).In(cst).Format("2006-01-02 15:04"), c.Rx, c.Tx, fmt.Sprintf("%10s", size.Format(guard.Usage(mode, c.Rx, c.Tx))), fired)
 	}
 }

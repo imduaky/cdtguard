@@ -3,7 +3,9 @@
 Tiny daemon for Aliyun CDT servers (200 GB/month, reset at 12:00 on the 1st, Beijing time).
 It counts NIC traffic and runs a command (default `shutdown now`) when the limit is reached.
 
-- Static binary, ~2 MB, no dependencies; the state file is a fixed **63 bytes** (overwritten in place, so it never grows and there is nothing to prune)
+- Static binary, ~2 MB, no dependencies; the state file is exactly **one filesystem block** (usually 4 KiB, replaced atomically, so it never grows and there is nothing to prune)
+- Keeps traffic history in that block: per day for the current cycle, per hour for the last 48 hours, and the last 12 cycles; `cdtguard status` shows all of it
+- Logs the current usage every time it grows by another 1% of the limit
 - `.deb` (systemd) and `.apk` (Alpine, OpenRC) packages for amd64/arm64
 - Bills like Aliyun CDT: `max(rx, tx)` of the NIC counters
 - Survives reboots: counters are folded in using the boot time
@@ -14,7 +16,7 @@ It counts NIC traffic and runs a command (default `shutdown now`) when the limit
 ```
 cdtguard run    [flags]            run the daemon
 cdtguard init   [flags] <usage>    set this cycle's real usage, e.g. cdtguard init 120G
-cdtguard status [flags]            show the saved state
+cdtguard status [flags]            show the saved state and traffic history
 ```
 
 Shared flags: `-state` (default `/var/lib/cdtguard/state.bin`), `-limit` (`195G`, 1024-based units), `-mode` (`max` = max(rx,tx) like Aliyun CDT, or `total` = rx+tx, `tx`, `rx`), `-iface` (run/init; auto when there is exactly one non-`lo` NIC, otherwise required).
@@ -39,7 +41,8 @@ Shared flags: `-state` (default `/var/lib/cdtguard/state.bin`), `-limit` (`195G`
   `init` also works at any other time to correct the counter (stop the daemon first); it overwrites the state file.
 - **State file exists**: if the server rebooted since the last save, the whole current counter is added to the stored total; otherwise only the delta.
 - **Fired once per cycle**: "fired" is written to disk *before* the command runs. If you power the server back on from the console after a shutdown, cdtguard logs a notice that the action already ran this month and will **not** run again until the next reset. If the command exits with an error it is retried on the next sample; if it is killed by a signal (systemd stopping the service because the system is going down) it counts as executed.
-- **Monthly reset**: on the 1st at 12:00 (UTC+8) usage and the fired flag are cleared. Traffic from the last sample before the reset is counted in the new month (errs on the safe side). The cycle only moves forward, so a clock stepped backwards never resets it.
+- **Traffic history**: each sample's traffic is booked to the current Beijing day and hour, so traffic while the daemon was stopped (or before a reboot) lands in the hour it resumes. Usage that predates per-day tracking (NIC counters at first start, `cdtguard init`) is shown as `untracked`. `init` keeps the existing history.
+- **Monthly reset**: on the 1st at 12:00 (UTC+8) the cycle is archived into the history, then usage and the fired flag are cleared. Traffic from the last sample before the reset is counted in the new month (errs on the safe side). The cycle only moves forward, so a clock stepped backwards never resets it.
 
 Want a speed limit (CAKE) instead of a shutdown? See [docs/throttle.md](docs/throttle.md).
 

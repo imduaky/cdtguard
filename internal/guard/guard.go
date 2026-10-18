@@ -30,6 +30,18 @@ func CycleStart(now time.Time) time.Time {
 	return t
 }
 
+// DayIndex returns the state.Daily slot that t falls in for the cycle that began
+// at start (unix time): the number of Beijing calendar days between them.
+func DayIndex(start int64, t time.Time) int {
+	i := int(midnight(t).Sub(midnight(time.Unix(start, 0))) / (24 * time.Hour))
+	return min(max(i, 0), state.Days-1)
+}
+
+func midnight(t time.Time) time.Time {
+	y, m, d := t.In(beijing).Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, beijing)
+}
+
 // Usage turns accumulated rx/tx into the number billed. mode is max (Aliyun CDT),
 // total, tx or rx.
 func Usage(mode string, rx, tx uint64) uint64 {
@@ -61,6 +73,7 @@ type Guard struct {
 
 	st           *state.State
 	pendingReset bool
+	reportedPct  uint64 // usage percentage last logged by reportProgress
 }
 
 func (g *Guard) now() time.Time {
@@ -77,6 +90,17 @@ func (g *Guard) logf(format string, a ...any) {
 }
 
 func (g *Guard) used() uint64 { return Usage(g.Mode, g.st.Rx, g.st.Tx) }
+
+func (g *Guard) usedPct() uint64 { return g.used() * 100 / g.Limit }
+
+// reportProgress logs the usage each time it grows by another 1% of the limit.
+func (g *Guard) reportProgress() {
+	pct := g.usedPct()
+	if pct > g.reportedPct {
+		g.logf("used %s / %s (%d%%) [rx %s, tx %s]", size.Format(g.used()), size.Format(g.Limit), pct, size.Format(g.st.Rx), size.Format(g.st.Tx))
+	}
+	g.reportedPct = pct // also follows the drop at a cycle reset
+}
 
 // Init loads (or creates) the state and folds in the current counters.
 // It reports whether the action already ran in the current cycle.
@@ -106,13 +130,22 @@ func (g *Guard) Init() (alreadyFired bool, err error) {
 	if err := state.Save(g.StatePath, g.st); err != nil {
 		return false, err
 	}
+	g.reportedPct = g.usedPct() // already logged above
 	return g.st.FiredAt != 0, nil
 }
 
 // SeedState builds the state for the current cycle from the NIC counters (rx, tx)
-// and the real usage so far, as reported by the user (`cdtguard init`).
-func SeedState(now time.Time, mode string, rx, tx, usage uint64) *state.State {
-	st := &state.State{PeriodStart: CycleStart(now).Unix(), SavedAt: now.Unix(), Rx: usage, Tx: usage, LastRx: rx, LastTx: tx}
+// and the real usage so far, as reported by the user (`cdtguard init`). The
+// traffic history of prev (the existing state, may be nil) is kept.
+func SeedState(now time.Time, mode string, rx, tx, usage uint64, prev *state.State) *state.State {
+	st := &state.State{}
+	if prev != nil {
+		*st = *prev
+	}
+	if cs := CycleStart(now).Unix(); st.PeriodStart != cs {
+		st.EndCycle(cs)
+	}
+	st.SavedAt, st.Rx, st.Tx, st.LastRx, st.LastTx, st.FiredAt = now.Unix(), usage, usage, rx, tx, 0
 	if mode == "total" {
 		st.Rx, st.Tx = usage/2, usage-usage/2
 	}
@@ -156,12 +189,15 @@ func (g *Guard) advance(now time.Time, rx, tx uint64, rebooted bool) {
 		// New billing cycle: quota was reset, so is our accounting. Traffic since
 		// the last sample may predate the reset; counting it here errs on the safe side.
 		g.pendingReset = g.pendingReset || s.FiredAt != 0
-		s.PeriodStart, s.FiredAt, s.Rx, s.Tx = cs, 0, incRx, incTx
-		g.logf("new billing cycle started, usage reset")
-	} else {
-		s.Rx += incRx
-		s.Tx += incTx
+		g.logf("new billing cycle started, usage reset (last cycle: %s)", size.Format(g.used()))
+		s.EndCycle(cs)
 	}
+	s.Rx += incRx
+	s.Tx += incTx
+	// Traffic since the last sample is booked to the current day and hour; after a
+	// stop or reboot that lumps the whole gap into it.
+	s.Daily[DayIndex(s.PeriodStart, now)].Add(incRx, incTx)
+	s.AddHourly(now.Unix()/3600, incRx, incTx)
 	s.LastRx, s.LastTx, s.SavedAt = rx, tx, now.Unix()
 }
 
@@ -174,6 +210,7 @@ func (g *Guard) Step(fire bool) error {
 	}
 	now := g.now()
 	g.advance(now, rx, tx, false)
+	g.reportProgress()
 
 	if g.pendingReset {
 		g.pendingReset = false

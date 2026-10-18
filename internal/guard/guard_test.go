@@ -2,6 +2,7 @@ package guard
 
 import (
 	"errors"
+	"fmt"
 	"os/exec"
 	"path/filepath"
 	"testing"
@@ -63,7 +64,7 @@ func newEnv(t *testing.T, boot time.Time) *env {
 // restart simulates a new cdtguard process (same config, fresh memory) after a boot.
 func (e *env) restart(boot time.Time) {
 	g := *e.g
-	g.st, g.pendingReset, g.Boot = nil, false, boot
+	g.st, g.pendingReset, g.reportedPct, g.Boot = nil, false, 0, boot
 	e.g = &g
 }
 
@@ -80,11 +81,11 @@ func TestFreshStartUsesCounters(t *testing.T) {
 
 func TestSeedState(t *testing.T) {
 	now := ts(2026, 10, 12, 0)
-	st := SeedState(now, "max", 30, 140, 60)
+	st := SeedState(now, "max", 30, 140, 60, nil)
 	if st.Rx != 60 || st.Tx != 60 || st.LastRx != 30 || st.LastTx != 140 || st.PeriodStart != CycleStart(now).Unix() {
 		t.Errorf("st = %+v", st)
 	}
-	if st := SeedState(now, "total", 1, 2, 61); st.Rx+st.Tx != 61 {
+	if st := SeedState(now, "total", 1, 2, 61, nil); st.Rx+st.Tx != 61 {
 		t.Errorf("total st = %+v", st)
 	}
 }
@@ -92,7 +93,7 @@ func TestSeedState(t *testing.T) {
 func TestSeededStateIsUsed(t *testing.T) {
 	e := newEnv(t, bootOld)
 	e.rx, e.tx = 30, 140 // counters alone would be over the limit
-	if err := state.Save(e.g.StatePath, SeedState(e.now, "max", e.rx, e.tx, 60)); err != nil {
+	if err := state.Save(e.g.StatePath, SeedState(e.now, "max", e.rx, e.tx, 60, nil)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := e.g.Init(); err != nil {
@@ -283,7 +284,7 @@ func TestRolloverWhileStopped(t *testing.T) {
 	// counts in the new cycle.
 	e := newEnv(t, bootOld)
 	e.tx = 50
-	if err := state.Save(e.g.StatePath, SeedState(e.now, "max", 0, e.tx, 60)); err != nil {
+	if err := state.Save(e.g.StatePath, SeedState(e.now, "max", 0, e.tx, 60, nil)); err != nil {
 		t.Fatal(err)
 	}
 	e.now, e.tx = ts(2026, 11, 2, 0), 70
@@ -299,5 +300,87 @@ func TestRolloverWhileStopped(t *testing.T) {
 	e.g.Init()
 	if e.g.used() != 30 {
 		t.Errorf("used = %d, want 30", e.g.used())
+	}
+}
+
+func TestReportsEveryPercent(t *testing.T) {
+	e := newEnv(t, bootThisCycle)
+	e.g.Limit = 1000
+	var logs []string
+	e.g.Logf = func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }
+	e.tx = 25
+	e.g.Init()
+	logs = nil
+	for _, tx := range []uint64{29, 30, 31, 55, 1050} { // 2%, 3%, 3%, 5%, 105%
+		e.tx = tx
+		e.g.Step(false)
+	}
+	if len(logs) != 3 {
+		t.Fatalf("logs = %q", logs)
+	}
+	if want := "used 30B / 1000B (3%) [rx 0B, tx 30B]"; logs[0] != want {
+		t.Errorf("got %q, want %q", logs[0], want)
+	}
+
+	// After the monthly reset reporting starts again from 0%.
+	e.now, e.tx = ts(2026, 11, 1, 12).Add(time.Minute), 1055
+	e.g.Step(false)
+	e.tx = 1065
+	e.g.Step(false)
+	if last := logs[len(logs)-1]; last != "used 15B / 1000B (1%) [rx 0B, tx 15B]" {
+		t.Errorf("logs = %q", logs)
+	}
+}
+
+func TestDayIndex(t *testing.T) {
+	start := ts(2026, 10, 1, 12).Unix()
+	cases := []struct {
+		t    time.Time
+		want int
+	}{
+		{ts(2026, 10, 1, 13), 0},
+		{ts(2026, 10, 2, 0), 1},
+		{ts(2026, 10, 31, 23), 30},
+		{ts(2026, 11, 1, 11), 31},
+		{ts(2026, 9, 30, 0), 0}, // clock behind the cycle start
+	}
+	for _, c := range cases {
+		if got := DayIndex(start, c.t); got != c.want {
+			t.Errorf("DayIndex(%v) = %d, want %d", c.t, got, c.want)
+		}
+	}
+}
+
+func TestHistoryIsRecorded(t *testing.T) {
+	e := newEnv(t, bootThisCycle)
+	e.rx, e.tx = 1, 5 // counters at first start: not attributable to a day
+	e.g.Init()
+	e.now, e.rx, e.tx = ts(2026, 10, 12, 1), 3, 15 // +2, +10 on 10-12, 01:00
+	e.g.Step(true)
+	e.now, e.tx = ts(2026, 10, 13, 9), 40 // +25 on 10-13
+	e.g.Step(true)
+
+	st, _ := state.Load(e.g.StatePath)
+	if st.Daily[11] != (state.Traffic{Rx: 2, Tx: 10}) || st.Daily[12] != (state.Traffic{Tx: 25}) {
+		t.Errorf("daily = %+v", st.Daily[10:14])
+	}
+	if h := e.now.Unix() / 3600; st.LastHour != h || st.Hourly[h%state.Hours] != (state.Traffic{Tx: 25}) {
+		t.Errorf("hourly last=%d %+v", st.LastHour, st.Hourly)
+	}
+
+	e.now, e.tx = ts(2026, 11, 1, 13), 45 // new cycle
+	e.g.Step(true)
+	want := state.Cycle{Start: ts(2026, 10, 1, 12).Unix(), Traffic: state.Traffic{Rx: 3, Tx: 40}}
+	if e.g.st.History[0] != want || e.g.st.Daily[0] != (state.Traffic{Tx: 5}) || e.g.st.Daily[12] != (state.Traffic{}) {
+		t.Errorf("history = %+v daily = %+v", e.g.st.History[0], e.g.st.Daily[:13])
+	}
+
+	// `cdtguard init` keeps the history.
+	seeded := SeedState(e.now, "max", 0, 0, 50, e.g.st)
+	if seeded.History[0] != want || seeded.Daily[0] != (state.Traffic{Tx: 5}) || seeded.Tx != 50 {
+		t.Errorf("seeded = %+v", seeded)
+	}
+	if seeded := SeedState(ts(2026, 12, 2, 0), "max", 0, 0, 50, e.g.st); seeded.History[0].Start != ts(2026, 11, 1, 12).Unix() || seeded.Daily[0] != (state.Traffic{}) {
+		t.Errorf("seeded in a later cycle must archive the old one: %+v", seeded.History[:2])
 	}
 }
