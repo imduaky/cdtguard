@@ -30,6 +30,27 @@ Shared flags: `-state` (default `/var/lib/cdtguard/state.bin`), `-limit` (`195G`
 | `-restore-cmd` | | Run at startup if `-cmd` already ran this cycle (e.g. re-apply a speed limit after reboot) |
 | `-interval` | `1m` | Sampling interval |
 
+`-reset-cmd` and `-restore-cmd` are useful for reversible actions such as
+traffic shaping: `-cmd` applies the limit action once, `-restore-cmd` reapplies
+it after a reboot in the same billing cycle, and `-reset-cmd` removes it when
+the next billing cycle starts. For a one-time test marker, `-cmd` is enough.
+
+To verify threshold handling without shutting down the machine, run with a low
+limit and make `-cmd` write a file. Initialize to zero first because Linux NIC
+counters include traffic from before the daemon starts:
+
+```bash
+sudo cdtguard init -iface eth0 -mode rx -limit 1M -state /tmp/cdtguard-test.state 0
+sudo cdtguard run -iface eth0 -mode rx -limit 1M -interval 1s \
+  -state /tmp/cdtguard-test.state \
+  -cmd 'printf threshold-reached > /tmp/cdtguard-limit-reached'
+```
+
+Generate more than 1 MiB of received traffic, then check
+`/tmp/cdtguard-limit-reached`. Replace `eth0` with the interface you want to
+monitor. The test state and marker paths can be anywhere writable by the
+process.
+
 ## Behaviour
 
 - **First start, no state file**: baseline = current NIC counters (traffic since boot). If the server booted before the current billing cycle, a warning says the counters include older traffic and suggests `cdtguard init`.
