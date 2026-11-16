@@ -14,6 +14,7 @@ import (
 
 	"github.com/imduaky/cdtguard/internal/config"
 	"github.com/imduaky/cdtguard/internal/guard"
+	statelock "github.com/imduaky/cdtguard/internal/lock"
 	"github.com/imduaky/cdtguard/internal/procfs"
 	"github.com/imduaky/cdtguard/internal/size"
 	"github.com/imduaky/cdtguard/internal/state"
@@ -29,7 +30,9 @@ const usage = `cdtguard - monthly traffic guard for Aliyun CDT
 Usage:
   cdtguard init [usage] [flags]  initialize this cycle's usage and config
   cdtguard run [flags]           run the daemon
+  cdtguard set [flags]           update a state file's configuration
   cdtguard status [flags]        show usage and history
+  cdtguard unlock [flags]        force unlock a state file
   cdtguard version
 
 Run "cdtguard <command> -h" for options and examples.`
@@ -75,10 +78,14 @@ func main() {
 	switch os.Args[1] {
 	case "run":
 		runCmd(args)
+	case "set":
+		setCmd(args)
 	case "init":
 		initCmd(args)
 	case "status":
 		statusCmd(args)
+	case "unlock":
+		unlockCmd(args)
 	case "version", "-version", "--version":
 		fmt.Println("cdtguard", version)
 	case "help", "-h", "--help":
@@ -87,6 +94,14 @@ func main() {
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s\n", os.Args[1], usage)
 		os.Exit(2)
 	}
+}
+
+func acquireState(statePath string, shared bool) *statelock.Handle {
+	h, err := statelock.Acquire(statePath, shared)
+	if err != nil {
+		log.Fatalf("lock state %s: %v", statePath, err)
+	}
+	return h
 }
 
 func runCmd(args []string) {
@@ -121,6 +136,8 @@ Safe test example (initialize a low limit and test state with cdtguard init firs
 	if err != nil || interval < time.Second {
 		log.Fatalf("invalid config interval %q (must be at least 1s)", cfg.Interval)
 	}
+	stateLock := acquireState(c.state, false)
+	defer stateLock.Release()
 	command := config.CommandString(cfg.Cmd)
 	restore := config.CommandString(cfg.RestoreCmd)
 	reset := config.CommandString(cfg.ResetCmd)
@@ -239,6 +256,8 @@ Examples:
 	if fs.NArg() > 1 {
 		log.Fatal("usage: cdtguard init [usage] [-limit 195G] [-mode max] [-iface eth0]")
 	}
+	stateLock := acquireState(c.state, false)
+	defer stateLock.Release()
 	c.resolveIface()
 	rx, tx, err := procfs.Counters(c.iface)
 	if err != nil {
@@ -265,6 +284,143 @@ Examples:
 	}
 	fmt.Printf("state written to %s: used %s / %s (iface %s, mode %s).\n", c.state, size.Format(used), size.Format(limit), c.iface, *mode)
 	fmt.Println("Start the daemon with: systemctl start cdtguard (systemd) or /etc/init.d/cdtguard start (OpenRC).")
+}
+
+func setCmd(args []string) {
+	var c common
+	fs := newFlags("set", &c)
+	limitText := fs.String("limit", "", "new traffic limit")
+	countedText := fs.String("counted", "", "current counted usage")
+	iface := fs.String("iface", "", "network interface")
+	mode := fs.String("mode", "", "billing mode: max, total, tx or rx")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, `Usage: cdtguard set [options]
+
+Updates the configuration in a state file. Omitted options keep their current values.
+
+Options:`)
+		fs.PrintDefaults()
+		fmt.Fprintln(os.Stderr, `
+Examples:
+  cdtguard set -state /var/lib/cdtguard/state.bin -limit 195G
+  cdtguard set -state /var/lib/cdtguard/state.bin -counted 20G -iface eth0 -mode max
+
+The state lock must be free. Use cdtguard unlock only after confirming that
+the owner is a stuck cdtguard process.`)
+	}
+	fs.Parse(args)
+	if *limitText == "" && *countedText == "" && *iface == "" && *mode == "" {
+		log.Fatal("set requires at least one of -limit, -counted, -iface or -mode")
+	}
+	stateLock := acquireState(c.state, false)
+	defer stateLock.Release()
+	st, err := state.Load(c.state)
+	if err != nil {
+		log.Fatalf("read state: %v (run cdtguard init first)", err)
+	}
+	limit, savedMode, savedIface := st.Config()
+	if limit == 0 || savedMode == "" {
+		log.Fatal("state file has no configuration; run `cdtguard init` first")
+	}
+	if *limitText != "" {
+		limit, err = size.Parse(*limitText)
+		if err != nil || limit == 0 {
+			log.Fatalf("invalid -limit %q", *limitText)
+		}
+	}
+	if *mode != "" {
+		savedMode = *mode
+	}
+	switch savedMode {
+	case "max", "total", "tx", "rx":
+	default:
+		log.Fatalf("invalid -mode %q (want max, total, tx or rx)", savedMode)
+	}
+	if *iface != "" {
+		savedIface = *iface
+	}
+	if savedIface == "" {
+		c.resolveIface()
+		savedIface = c.iface
+	}
+
+	rx, tx, err := procfs.Counters(savedIface)
+	if err != nil {
+		log.Fatalf("read counters: %v", err)
+	}
+	var counted uint64
+	if *countedText != "" {
+		counted, err = size.Parse(*countedText)
+		if err != nil {
+			log.Fatalf("invalid -counted %q", *countedText)
+		}
+	} else {
+		counted = guard.Usage(savedMode, st.Rx, st.Tx)
+	}
+	if counted >= limit {
+		log.Fatalf("counted usage %s is not below limit %s", size.Format(counted), size.Format(limit))
+	}
+	if *countedText != "" {
+		st = guard.SeedState(time.Now(), savedMode, rx, tx, counted, st)
+	} else if savedIface != stIface(st) {
+		st.LastRx, st.LastTx = rx, tx
+		st.SavedAt = time.Now().Unix()
+	}
+	st.SetConfig(limit, savedMode, savedIface)
+	if err := state.Save(c.state, st); err != nil {
+		log.Fatalf("write state: %v", err)
+	}
+	fmt.Printf("state updated: %s (used %s / %s, iface %s, mode %s).\n", c.state, size.Format(counted), size.Format(limit), savedIface, savedMode)
+}
+
+func stIface(st *state.State) string {
+	_, _, iface := st.Config()
+	return iface
+}
+
+func unlockCmd(args []string) {
+	var c common
+	fs := newFlags("unlock", &c)
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, `Usage: cdtguard unlock [-state path]
+
+Stops the process holding the state lock after interactive confirmation.
+It never removes the lock file; the kernel releases the lock when the owner exits.`)
+		fs.PrintDefaults()
+	}
+	fs.Parse(args)
+	fmt.Fprintf(os.Stderr, "Force unlock state %s? This may terminate its cdtguard owner. Type y or YES: ", c.state)
+	var answer string
+	if _, err := fmt.Fscan(os.Stdin, &answer); err != nil || (answer != "y" && answer != "Y" && answer != "YES") {
+		log.Fatal("unlock cancelled")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	sentPID := 0
+	for {
+		h, err := statelock.Acquire(c.state, false)
+		if err == nil {
+			_ = h.Release()
+			fmt.Printf("state unlocked: %s\n", c.state)
+			return
+		}
+		var busy *statelock.BusyError
+		if !errors.As(err, &busy) {
+			log.Fatalf("unlock state %s: %v", c.state, err)
+		}
+		if busy.OwnerPID > 1 && busy.OwnerPID != sentPID && statelock.OwnerHolds(c.state, busy.OwnerPID) {
+			if err := syscall.Kill(busy.OwnerPID, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+				log.Fatalf("terminate lock owner pid %d: %v", busy.OwnerPID, err)
+			}
+			sentPID = busy.OwnerPID
+		}
+		if time.Now().After(deadline) {
+			if busy.OwnerPID > 1 {
+				log.Fatalf("state remains locked by pid %d", busy.OwnerPID)
+			}
+			log.Fatal("state remains locked")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // reorderInitArgs lets the optional usage appear before flags, as in
@@ -299,6 +455,8 @@ func statusCmd(args []string) {
 		fs.PrintDefaults()
 	}
 	fs.Parse(args)
+	stateLock := acquireState(c.state, true)
+	defer stateLock.Release()
 	st, err := state.Load(c.state)
 	if err != nil {
 		log.Fatalf("read state: %v", err)

@@ -46,6 +46,25 @@ interval = "1m"
 cdtguard status
 ```
 
+## 修改状态
+
+运行中的实例会独占 state 文件。需要修改限额、已计费用量或网卡时，先停止服务，再执行：
+
+```bash
+sudo cdtguard set -state /var/lib/cdtguard/state.bin -limit 195G
+sudo cdtguard set -state /var/lib/cdtguard/state.bin -counted 20G -iface eth0 -mode max
+```
+
+只填写需要修改的选项，其他值保持不变。每个 state 使用同目录下的 `.lock` 文件协调并发；`run`、`init`、`set` 和 `status` 不能同时操作同一个 state，冲突时命令会直接报错。
+
+如果进程异常退出后仍需处理占用，可以确认没有需要保留的实例后强制解锁：
+
+```bash
+sudo cdtguard unlock -state /var/lib/cdtguard/state.bin
+```
+
+命令会要求输入 `y` 或 `YES`，并向仍持有该 state 锁的进程发送 `SIGTERM`。它不会删除锁文件；进程退出后由内核释放锁。
+
 状态中的 `initial baseline` 是初始化 state 时已经存在、无法归属到具体日期的流量，不代表丢失统计；`used` 会将它和之后 daemon 运行期间采集的每日增量相加。初始化后 daemon 停止期间产生的流量，要等下一次 `run` 采样后才会写入 state。
 
 默认达到限额时执行 TOML 中的 `cmd`，每分钟采样一次。命令行选项和限速等高级示例见：
