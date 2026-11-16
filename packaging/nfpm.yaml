@@ -16,8 +16,8 @@ contents:
   - src: packaging/cdtguard.service
     dst: /usr/lib/systemd/system/cdtguard.service
     packager: deb
-  - src: packaging/cdtguard.default
-    dst: /etc/default/cdtguard
+  - src: packaging/cdtguard.conf
+    dst: /etc/cdtguard.conf
     type: config|noreplace
     packager: deb
   # OpenRC (apk / Alpine has no systemd)
@@ -25,8 +25,8 @@ contents:
     dst: /etc/init.d/cdtguard
     file_info: {mode: 0755}
     packager: apk
-  - src: packaging/cdtguard.confd
-    dst: /etc/conf.d/cdtguard
+  - src: packaging/cdtguard.conf
+    dst: /etc/cdtguard.conf
     type: config|noreplace
     packager: apk
   - dst: /var/lib/cdtguard

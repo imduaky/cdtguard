@@ -1,6 +1,7 @@
 #!/sbin/openrc-run
 description="CDTGuard - monthly traffic guard"
 command="/usr/bin/cdtguard"
+command_args="run -c /etc/cdtguard.conf"
 command_background=true
 pidfile="/run/${RC_SVCNAME}.pid"
 output_log="/var/log/cdtguard.log"

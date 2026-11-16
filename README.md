@@ -26,9 +26,19 @@ sudo rc-service cdtguard start
 
 `-iface`、`-mode` 和 `-limit` 会保存在 `/var/lib/cdtguard/state.bin` 中。只有一张可用网卡时，网卡会自动选择；`lo`、Tailscale、WireGuard 和常见容器、桥接、隧道接口会被忽略。多张可用网卡时，请用 `-iface` 指定，例如 `ens2`。
 
-初始化后，服务会运行 `cdtguard run`，默认命令由环境文件中的 `-cmd shutdown` 提供。手动运行时请显式指定 `-cmd`；没有 state 文件时会自动选择网卡，并以默认的 `195G` 和 `max` 配置开始；如果初始累计流量已经达到限额，程序会拒绝启动。
+初始化后，服务会运行 `cdtguard run -c /etc/cdtguard.conf`，运行参数由 `/etc/cdtguard.conf` 中的 TOML 配置提供。`state` 路径仍通过 `-state` 指定，因此同一份配置可以复用于多个 state 文件。
 
-需要自定义运行参数时，Debian 编辑 `/etc/default/cdtguard`，Alpine 编辑 `/etc/conf.d/cdtguard`；通常的限额、模式和网卡配置仍使用 `cdtguard init` 保存。
+配置文件示例：
+
+```toml
+cmd = ["shutdown"]
+restore_cmd = []
+reset_cmd = []
+iface = ""
+interval = "1m"
+```
+
+命令使用数组保存，参数中的空格不会被拆开，例如 `cmd = ["systemctl", "stop", "sing-box"]`。`iface` 留空时使用 state 中保存的网卡；没有 state 文件时会自动选择网卡，并以默认的 `195G` 和 `max` 配置开始。
 
 查看用量和历史：
 
@@ -36,12 +46,18 @@ sudo rc-service cdtguard start
 cdtguard status
 ```
 
-默认达到限额时执行环境文件中的 `shutdown`，每分钟采样一次。命令行选项和限速等高级示例见：
+默认达到限额时执行 TOML 中的 `cmd`，每分钟采样一次。命令行选项和限速等高级示例见：
 
 ```bash
 cdtguard init -h
 cdtguard run -h
 cdtguard status -h
+```
+
+手动运行或测试其他 state：
+
+```bash
+sudo cdtguard run -c /etc/cdtguard.conf -state /tmp/cdtguard-test.state
 ```
 
 ## 查看日志

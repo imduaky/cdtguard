@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/imduaky/cdtguard/internal/config"
 	"github.com/imduaky/cdtguard/internal/guard"
 	"github.com/imduaky/cdtguard/internal/procfs"
 	"github.com/imduaky/cdtguard/internal/size"
@@ -33,6 +34,8 @@ Usage:
 
 Run "cdtguard <command> -h" for options and examples.`
 
+const defaultConfigPath = "/etc/cdtguard.conf"
+
 // common holds the flags shared by every subcommand.
 type common struct {
 	iface, state string
@@ -41,9 +44,6 @@ type common struct {
 func newFlags(name string, c *common) *flag.FlagSet {
 	fs := flag.NewFlagSet(name, flag.ExitOnError)
 	fs.StringVar(&c.state, "state", "/var/lib/cdtguard/state.bin", "state file path")
-	if name == "run" {
-		fs.StringVar(&c.iface, "iface", "", "network interface (defaults to the one saved by init)")
-	}
 	return fs
 }
 
@@ -61,7 +61,7 @@ func (c *common) resolveIface() {
 	case 1:
 		c.iface = ifs[0]
 	default:
-		log.Fatalf("multiple eligible interfaces %v found, please choose one with -iface", ifs)
+		log.Fatalf("multiple eligible interfaces %v found; set iface in the TOML config or choose one with init -iface", ifs)
 	}
 }
 
@@ -92,34 +92,40 @@ func main() {
 func runCmd(args []string) {
 	var c common
 	fs := newFlags("run", &c)
-	command := fs.String("cmd", "", "required shell command to run when the limit is reached")
-	restore := fs.String("restore-cmd", "", "run at startup after firing this cycle; reapply state lost on reboot (e.g. traffic shaping)")
-	reset := fs.String("reset-cmd", "", "run at the next cycle after firing; undo a reversible action (e.g. lift traffic shaping)")
-	interval := fs.Duration("interval", time.Minute, "traffic sampling interval")
+	configPath := fs.String("c", defaultConfigPath, "TOML runtime configuration file")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, `Usage: cdtguard run [options]
 
-Runs with configuration saved in the state file. -iface overrides its saved interface.
+Runs with runtime options from a TOML file and accounting limits from the state file.
+Use -state to select the state file and -c to select the TOML file.
 
 Options:`)
 		fs.PrintDefaults()
 		fmt.Fprintln(os.Stderr, `
-Traffic shaping example (enable at limit, reapply after reboot, remove at cycle reset):
-  cdtguard run \
-    -cmd '/usr/local/bin/cdtguard-throttle on' \
-    -restore-cmd '/usr/local/bin/cdtguard-throttle on' \
-    -reset-cmd '/usr/local/bin/cdtguard-throttle off'
+TOML example:
+  cmd = ["systemctl", "stop", "sing-box"]
+  restore_cmd = ["systemctl", "stop", "sing-box"]
+  reset_cmd = ["systemctl", "restart", "sing-box"]
+  iface = "eth0"
+  interval = "1m"
 
 Safe test example (initialize a low limit and test state with cdtguard init first):
-  cdtguard run -state /tmp/cdtguard-test.state -interval 1s \
-    -cmd 'printf reached > /tmp/cdtguard-reached'`)
+  cdtguard run -c /tmp/cdtguard-test.conf -state /tmp/cdtguard-test.state`)
 	}
 	fs.Parse(args)
-	if strings.TrimSpace(*command) == "" {
-		log.Fatal("-cmd is required (set it in the service environment file or pass it to cdtguard run)")
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		log.Fatalf("read config %s: %v", *configPath, err)
 	}
-	if *interval < time.Second {
-		log.Fatal("-interval must be at least 1s")
+	interval, err := time.ParseDuration(cfg.Interval)
+	if err != nil || interval < time.Second {
+		log.Fatalf("invalid config interval %q (must be at least 1s)", cfg.Interval)
+	}
+	command := config.CommandString(cfg.Cmd)
+	restore := config.CommandString(cfg.RestoreCmd)
+	reset := config.CommandString(cfg.ResetCmd)
+	if cfg.Iface != "" {
+		c.iface = cfg.Iface
 	}
 	st, err := state.Load(c.state)
 	if err != nil && !os.IsNotExist(err) {
@@ -161,16 +167,16 @@ Safe test example (initialize a low limit and test state with cdtguard init firs
 		}
 		log.Printf("no initialized configuration found; using defaults: limit=%s mode=%s iface=%s", size.Format(limit), mode, c.iface)
 	} else if c.iface != savedIface {
-		log.Printf("using iface override %s (saved default is %s)", c.iface, savedIface)
+		log.Printf("using iface from TOML config %s (saved default is %s)", c.iface, savedIface)
 		rx, tx, err := procfs.Counters(c.iface)
 		if err != nil {
-			log.Fatalf("read counters for -iface override: %v", err)
+			log.Fatalf("read counters for TOML iface: %v", err)
 		}
 		st.LastRx, st.LastTx = rx, tx
 		st.SavedAt = time.Now().Unix()
 		st.SetConfig(limit, mode, c.iface)
 		if err := state.Save(c.state, st); err != nil {
-			log.Fatalf("save -iface override: %v", err)
+			log.Fatalf("save TOML iface: %v", err)
 		}
 	}
 	boot, err := procfs.BootTime()
@@ -182,17 +188,17 @@ Safe test example (initialize a low limit and test state with cdtguard init firs
 		StatePath:  c.state,
 		Limit:      limit,
 		Mode:       mode,
-		Command:    *command,
-		ResetCmd:   *reset,
-		RestoreCmd: *restore,
-		Interval:   *interval,
+		Command:    command,
+		ResetCmd:   reset,
+		RestoreCmd: restore,
+		Interval:   interval,
 		Boot:       boot,
 		Logf:       log.Printf,
 		Counter:    func() (uint64, uint64, error) { return procfs.Counters(c.iface) },
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	log.Printf("cdtguard %s: iface=%s mode=%s limit=%s cmd=%q", version, c.iface, mode, size.Format(limit), *command)
+	log.Printf("cdtguard %s: iface=%s mode=%s limit=%s cmd=%q", version, c.iface, mode, size.Format(limit), command)
 	if err := g.Run(ctx); err != nil {
 		if errors.Is(err, guard.ErrOverLimit) {
 			log.Print(err)

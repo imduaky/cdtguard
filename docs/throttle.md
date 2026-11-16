@@ -10,9 +10,9 @@ cycle**, so three hooks are needed:
 
 | When | `cdtguard run` flag | Script call |
 |---|---|---|
-| limit reached | `-cmd` | `cdtguard-throttle on` |
-| server rebooted later in the same cycle | `-restore-cmd` | `cdtguard-throttle on` |
-| quota reset (1st, 12:00 Beijing) | `-reset-cmd` | `cdtguard-throttle off` |
+| limit reached | `cmd` | `cdtguard-throttle on` |
+| server rebooted later in the same cycle | `restore_cmd` | `cdtguard-throttle on` |
+| quota reset (1st, 12:00 Beijing) | `reset_cmd` | `cdtguard-throttle off` |
 
 ## 1. Script `/usr/local/bin/cdtguard-throttle`
 
@@ -67,26 +67,23 @@ are saved by `init`):
 sudo cdtguard init 20G --limit 190G -iface eth0 -mode max
 ```
 
-Commands contain spaces, so override `ExecStart` to add the run hooks:
+Commands are argv arrays in `/etc/cdtguard.conf`, so spaces are preserved:
 
-```bash
-sudo systemctl edit cdtguard
+```toml
+cmd = ["/usr/local/bin/cdtguard-throttle", "on"]
+restore_cmd = ["/usr/local/bin/cdtguard-throttle", "on"]
+reset_cmd = ["/usr/local/bin/cdtguard-throttle", "off"]
 ```
-```ini
-[Service]
-ExecStart=
-ExecStart=/usr/bin/cdtguard run \
-  -cmd "/usr/local/bin/cdtguard-throttle on" \
-  -restore-cmd "/usr/local/bin/cdtguard-throttle on" \
-  -reset-cmd "/usr/local/bin/cdtguard-throttle off"
-```
+
 ```bash
 sudo systemctl restart cdtguard
 ```
 
-Alpine (OpenRC), add the run hooks to `/etc/init.d/cdtguard`'s `command_args`:
-```sh
-command_args="run -cmd '/usr/local/bin/cdtguard-throttle on' -restore-cmd '/usr/local/bin/cdtguard-throttle on' -reset-cmd '/usr/local/bin/cdtguard-throttle off'"
+Alpine (OpenRC) uses the same `/etc/cdtguard.conf` file:
+```toml
+cmd = ["/usr/local/bin/cdtguard-throttle", "on"]
+restore_cmd = ["/usr/local/bin/cdtguard-throttle", "on"]
+reset_cmd = ["/usr/local/bin/cdtguard-throttle", "off"]
 ```
 
 ## Caveats
@@ -97,4 +94,4 @@ command_args="run -cmd '/usr/local/bin/cdtguard-throttle on' -restore-cmd '/usr/
 - Set `-limit` lower than you would for shutdown (e.g. 190G) so the traffic that still gets
   through while throttled stays within the 200 GB quota.
 - cdtguard keeps counting while throttled; the throttle is lifted automatically at the
-  next reset by `-reset-cmd`.
+  next reset by `reset_cmd`.
