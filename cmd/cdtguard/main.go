@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -25,41 +26,25 @@ var cst = time.FixedZone("CST", 8*3600)
 const usage = `cdtguard - monthly traffic guard for Aliyun CDT
 
 Usage:
-  cdtguard run    [flags]           run the daemon
-  cdtguard init   [flags] <usage>   set this cycle's real usage (e.g. 120G); stop the daemon first
-  cdtguard status [flags]           show the saved state
+  cdtguard init [usage] [flags]  initialize this cycle's usage and config
+  cdtguard run [flags]           run the daemon
+  cdtguard status [flags]        show usage and history
   cdtguard version
 
-Run "cdtguard <command> -h" for flags.`
+Run "cdtguard <command> -h" for options and examples.`
 
 // common holds the flags shared by every subcommand.
 type common struct {
-	iface, limit, state, mode string
+	iface, state string
 }
 
 func newFlags(name string, c *common) *flag.FlagSet {
 	fs := flag.NewFlagSet(name, flag.ExitOnError)
 	fs.StringVar(&c.state, "state", "/var/lib/cdtguard/state.bin", "state file path")
-	fs.StringVar(&c.limit, "limit", "195G", "traffic limit per billing cycle")
-	fs.StringVar(&c.mode, "mode", "max", "what to bill: max (max(rx,tx), Aliyun CDT), total (rx+tx), tx, rx")
-	if name != "status" {
-		fs.StringVar(&c.iface, "iface", "", "network interface (auto-detected when the host has exactly one non-lo NIC)")
+	if name == "run" {
+		fs.StringVar(&c.iface, "iface", "", "network interface (defaults to the one saved by init)")
 	}
 	return fs
-}
-
-// parse validates the shared flags and returns the limit in bytes.
-func (c *common) parse() uint64 {
-	limit, err := size.Parse(c.limit)
-	if err != nil || limit == 0 {
-		log.Fatalf("invalid -limit %q", c.limit)
-	}
-	switch c.mode {
-	case "max", "total", "tx", "rx":
-	default:
-		log.Fatalf("invalid -mode %q (want max, total, tx or rx)", c.mode)
-	}
-	return limit
 }
 
 func (c *common) resolveIface() {
@@ -76,7 +61,7 @@ func (c *common) resolveIface() {
 	case 1:
 		c.iface = ifs[0]
 	default:
-		log.Fatalf("multiple interfaces %v found, please choose one with -iface", ifs)
+		log.Fatalf("multiple eligible interfaces %v found, please choose one with -iface", ifs)
 	}
 }
 
@@ -108,15 +93,83 @@ func runCmd(args []string) {
 	var c common
 	fs := newFlags("run", &c)
 	command := fs.String("cmd", "shutdown now", "shell command to run when the limit is reached")
-	resetCmd := fs.String("reset-cmd", "", "shell command to run when a new cycle begins after -cmd had run (e.g. lift a speed limit)")
-	restore := fs.String("restore-cmd", "", "shell command to run at startup when -cmd already ran this cycle (e.g. re-apply a speed limit after reboot)")
-	interval := fs.Duration("interval", time.Minute, "sampling interval")
+	restore := fs.String("restore-cmd", "", "run at startup after firing this cycle; reapply state lost on reboot (e.g. traffic shaping)")
+	reset := fs.String("reset-cmd", "", "run at the next cycle after firing; undo a reversible action (e.g. lift traffic shaping)")
+	interval := fs.Duration("interval", time.Minute, "traffic sampling interval")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, `Usage: cdtguard run [options]
+
+Runs with configuration saved in the state file. -iface overrides its saved interface.
+
+Options:`)
+		fs.PrintDefaults()
+		fmt.Fprintln(os.Stderr, `
+Traffic shaping example (enable at limit, reapply after reboot, remove at cycle reset):
+  cdtguard run \
+    -cmd '/usr/local/bin/cdtguard-throttle on' \
+    -restore-cmd '/usr/local/bin/cdtguard-throttle on' \
+    -reset-cmd '/usr/local/bin/cdtguard-throttle off'
+
+Safe test example (initialize a low limit and test state with cdtguard init first):
+  cdtguard run -state /tmp/cdtguard-test.state -interval 1s \
+    -cmd 'printf reached > /tmp/cdtguard-reached'`)
+	}
 	fs.Parse(args)
-	limit := c.parse()
 	if *interval < time.Second {
 		log.Fatal("-interval must be at least 1s")
 	}
-	c.resolveIface()
+	st, err := state.Load(c.state)
+	if err != nil && !os.IsNotExist(err) {
+		log.Fatalf("read state: %v", err)
+	}
+	limit, mode, savedIface := uint64(0), "", ""
+	if st != nil {
+		limit, mode, savedIface = st.Config()
+	}
+	if c.iface == "" {
+		if savedIface != "" {
+			c.iface = savedIface
+		} else {
+			c.resolveIface()
+		}
+	}
+	if limit == 0 || mode == "" {
+		limit, mode = 195<<30, "max"
+		rx, tx, err := procfs.Counters(c.iface)
+		if err != nil {
+			log.Fatalf("read counters: %v", err)
+		}
+		if st == nil {
+			now := time.Now()
+			st = &state.State{
+				PeriodStart: guard.CycleStart(now).Unix(), SavedAt: now.Unix(),
+				Rx: rx, Tx: tx, LastRx: rx, LastTx: tx,
+			}
+		} else {
+			st.LastRx, st.LastTx, st.SavedAt = rx, tx, time.Now().Unix()
+			st.SetConfig(limit, mode, c.iface)
+		}
+		if used := guard.Usage(mode, st.Rx, st.Tx); used >= limit {
+			log.Fatalf("initial usage %s is at or above the default limit %s; run `cdtguard init <usage> -limit <limit> -iface %s` with the real usage", size.Format(used), size.Format(limit), c.iface)
+		}
+		st.SetConfig(limit, mode, c.iface)
+		if err := state.Save(c.state, st); err != nil {
+			log.Fatalf("write initial state: %v", err)
+		}
+		log.Printf("no initialized configuration found; using defaults: limit=%s mode=%s iface=%s", size.Format(limit), mode, c.iface)
+	} else if c.iface != savedIface {
+		log.Printf("using iface override %s (saved default is %s)", c.iface, savedIface)
+		rx, tx, err := procfs.Counters(c.iface)
+		if err != nil {
+			log.Fatalf("read counters for -iface override: %v", err)
+		}
+		st.LastRx, st.LastTx = rx, tx
+		st.SavedAt = time.Now().Unix()
+		st.SetConfig(limit, mode, c.iface)
+		if err := state.Save(c.state, st); err != nil {
+			log.Fatalf("save -iface override: %v", err)
+		}
+	}
 	boot, err := procfs.BootTime()
 	if err != nil {
 		log.Fatalf("read boot time: %v", err)
@@ -125,9 +178,9 @@ func runCmd(args []string) {
 	g := &guard.Guard{
 		StatePath:  c.state,
 		Limit:      limit,
-		Mode:       c.mode,
+		Mode:       mode,
 		Command:    *command,
-		ResetCmd:   *resetCmd,
+		ResetCmd:   *reset,
 		RestoreCmd: *restore,
 		Interval:   *interval,
 		Boot:       boot,
@@ -136,7 +189,7 @@ func runCmd(args []string) {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	log.Printf("cdtguard %s: iface=%s mode=%s limit=%s cmd=%q", version, c.iface, c.mode, size.Format(limit), *command)
+	log.Printf("cdtguard %s: iface=%s mode=%s limit=%s cmd=%q", version, c.iface, mode, size.Format(limit), *command)
 	if err := g.Run(ctx); err != nil {
 		if errors.Is(err, guard.ErrOverLimit) {
 			log.Print(err)
@@ -149,41 +202,104 @@ func runCmd(args []string) {
 func initCmd(args []string) {
 	var c common
 	fs := newFlags("init", &c)
-	fs.Parse(args)
-	limit := c.parse()
-	if fs.NArg() != 1 {
-		log.Fatal("usage: cdtguard init [flags] <usage>   e.g. cdtguard init 120G")
+	fs.StringVar(&c.iface, "iface", "", "network interface (auto-selected when exactly one eligible NIC is found)")
+	limitText := fs.String("limit", "195G", "traffic limit per billing cycle")
+	mode := fs.String("mode", "max", "billing mode: max, total, tx or rx; max matches Aliyun CDT")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, `Usage: cdtguard init [current-usage] [options]
+
+If usage is omitted, the selected NIC's current counters are used as initial usage.
+
+Options:`)
+		fs.PrintDefaults()
+		fmt.Fprintln(os.Stderr, `
+Examples:
+  cdtguard init 20G -limit 195G -iface ens2 -mode max
+  cdtguard init -limit 195G -iface ens2 -mode max`)
 	}
-	used, err := size.Parse(fs.Arg(0))
-	if err != nil {
-		log.Fatalf("invalid usage %q", fs.Arg(0))
+	fs.Parse(reorderInitArgs(args))
+	limit, err := size.Parse(*limitText)
+	if err != nil || limit == 0 {
+		log.Fatalf("invalid -limit %q", *limitText)
 	}
-	if used >= limit {
-		log.Fatalf("usage %s is not below the limit %s; the daemon would refuse to start", size.Format(used), size.Format(limit))
+	switch *mode {
+	case "max", "total", "tx", "rx":
+	default:
+		log.Fatalf("invalid -mode %q (want max, total, tx or rx)", *mode)
+	}
+	if fs.NArg() > 1 {
+		log.Fatal("usage: cdtguard init [usage] [-limit 195G] [-mode max] [-iface eth0]")
 	}
 	c.resolveIface()
 	rx, tx, err := procfs.Counters(c.iface)
 	if err != nil {
 		log.Fatalf("read counters: %v", err)
 	}
+	used := guard.Usage(*mode, rx, tx)
+	if fs.NArg() == 1 {
+		used, err = size.Parse(fs.Arg(0))
+		if err != nil {
+			log.Fatalf("invalid usage %q", fs.Arg(0))
+		}
+	}
+	if used >= limit {
+		log.Fatalf("usage %s is not below the limit %s; choose an initial usage below the limit", size.Format(used), size.Format(limit))
+	}
 	prev, _ := state.Load(c.state) // keep its traffic history, if readable
-	if err := state.Save(c.state, guard.SeedState(time.Now(), c.mode, rx, tx, used, prev)); err != nil {
+	st := guard.SeedState(time.Now(), *mode, rx, tx, used, prev)
+	if fs.NArg() == 0 {
+		st.Rx, st.Tx = rx, tx
+	}
+	st.SetConfig(limit, *mode, c.iface)
+	if err := state.Save(c.state, st); err != nil {
 		log.Fatalf("write state: %v", err)
 	}
-	fmt.Printf("state written to %s: used %s / %s (iface %s). Start the daemon now.\n", c.state, size.Format(used), size.Format(limit), c.iface)
+	fmt.Printf("state written to %s: used %s / %s (iface %s, mode %s).\n", c.state, size.Format(used), size.Format(limit), c.iface, *mode)
+	fmt.Println("Start the daemon with: systemctl start cdtguard (systemd) or /etc/init.d/cdtguard start (OpenRC).")
+}
+
+// reorderInitArgs lets the optional usage appear before flags, as in
+// `cdtguard init 20G --limit 195G -iface eth0`.
+func reorderInitArgs(args []string) []string {
+	var flags, positional []string
+	valueNext := false
+	for _, arg := range args {
+		if valueNext {
+			flags = append(flags, arg)
+			valueNext = false
+			continue
+		}
+		if strings.HasPrefix(arg, "-") {
+			flags = append(flags, arg)
+			if !strings.Contains(arg, "=") {
+				name := strings.TrimLeft(arg, "-")
+				valueNext = name == "iface" || name == "limit" || name == "mode" || name == "state"
+			}
+			continue
+		}
+		positional = append(positional, arg)
+	}
+	return append(flags, positional...)
 }
 
 func statusCmd(args []string) {
 	var c common
 	fs := newFlags("status", &c)
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: cdtguard status [-state path]")
+		fs.PrintDefaults()
+	}
 	fs.Parse(args)
-	limit := c.parse()
 	st, err := state.Load(c.state)
 	if err != nil {
 		log.Fatalf("read state: %v", err)
 	}
-	used := guard.Usage(c.mode, st.Rx, st.Tx)
-	fmt.Printf("used:    %s / %s (%.1f%%)  [rx %s, tx %s, mode %s]\n", size.Format(used), size.Format(limit), float64(used)*100/float64(limit), size.Format(st.Rx), size.Format(st.Tx), c.mode)
+	limit, mode, iface := st.Config()
+	if limit == 0 || mode == "" {
+		log.Fatal("state file has no configuration; run `cdtguard init` first")
+	}
+	used := guard.Usage(mode, st.Rx, st.Tx)
+	fmt.Printf("used:    %s / %s (%.1f%%)  [rx %s, tx %s, mode %s, iface %s]\n", size.Format(used), size.Format(limit), float64(used)*100/float64(limit), size.Format(st.Rx), size.Format(st.Tx), mode, iface)
 	fmt.Printf("cycle:   since %s\n", time.Unix(st.PeriodStart, 0).In(cst).Format("2006-01-02 15:04 MST"))
 	fmt.Printf("updated: %s\n", time.Unix(st.SavedAt, 0).Format(time.DateTime))
 	if st.FiredAt != 0 {
@@ -193,7 +309,7 @@ func statusCmd(args []string) {
 	}
 	printDaily(st)
 	printHourly(st)
-	printHistory(st, c.mode)
+	printHistory(st, mode)
 }
 
 func row(label string, rx, tx uint64, extra ...string) {

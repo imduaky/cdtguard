@@ -4,11 +4,11 @@
 //
 // The file is padded with zeros to fill whole filesystem blocks (one 4 KiB block
 // in practice). The crc32 is always the last 4 bytes and covers everything before
-// it. Version 1 files (63 bytes, no traffic history) still load; their history
-// fields come back as zero.
+// it.
 package state
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -26,8 +26,7 @@ const (
 )
 
 const (
-	version    = 2
-	legacySize = 63 // version 1 file
+	version = 3
 
 	defaultBlock = 4096
 	maxBlock     = 64 << 10
@@ -54,7 +53,7 @@ type Cycle struct {
 }
 
 // State is everything the guard remembers between runs. Fields are encoded in
-// order; new ones go at the end so older files keep decoding.
+// declaration order.
 type State struct {
 	PeriodStart int64  // unix time the current billing cycle began
 	SavedAt     int64  // unix time of the last update
@@ -62,11 +61,29 @@ type State struct {
 	LastRx      uint64 // NIC rx counter at SavedAt
 	LastTx      uint64 // NIC tx counter at SavedAt
 	FiredAt     int64  // unix time the action ran this cycle; 0 = not yet
-	// Version 2: traffic history.
+	// Traffic history.
 	Daily    [Days]Traffic  // per Beijing calendar day; index 0 = the day the cycle began
 	LastHour int64          // unix hour (unix time / 3600) of the newest Hourly slot
 	Hourly   [Hours]Traffic // slot h%Hours holds unix hour h, for the Hours up to LastHour
 	History  [Cycles]Cycle  // finished cycles, newest first
+	// Configuration written by `cdtguard init`.
+	Limit uint64
+	Mode  [8]byte
+	Iface [16]byte
+}
+
+// SetConfig stores the configuration selected by `cdtguard init`.
+func (s *State) SetConfig(limit uint64, mode, iface string) {
+	s.Limit = limit
+	s.Mode = [8]byte{}
+	s.Iface = [16]byte{}
+	copy(s.Mode[:], mode)
+	copy(s.Iface[:], iface)
+}
+
+// Config returns the saved limit, mode, and interface.
+func (s *State) Config() (limit uint64, mode, iface string) {
+	return s.Limit, string(bytes.TrimRight(s.Mode[:], "\x00")), string(bytes.TrimRight(s.Iface[:], "\x00"))
 }
 
 // EndCycle archives the current cycle into History and clears the per-cycle
@@ -123,16 +140,14 @@ func Load(path string) (*State, error) {
 		return nil, err
 	}
 	n := len(b)
-	ok := n >= legacySize && n <= maxBlock && b[0] == magic[0] && b[1] == magic[1] &&
+	ok := n >= minSize && n <= maxBlock && b[0] == magic[0] && b[1] == magic[1] &&
 		binary.BigEndian.Uint32(b[n-4:]) == crc32.ChecksumIEEE(b[:n-4]) &&
-		(b[2] == 1 && n == legacySize || b[2] == version && n >= minSize)
+		b[2] == version
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrCorrupt, path)
 	}
-	body := make([]byte, bodySize) // a version 1 body is a prefix; the rest stays zero
-	copy(body, b[3:n-4])
 	s := new(State)
-	if _, err := binary.Decode(body, binary.BigEndian, s); err != nil {
+	if _, err := binary.Decode(b[3:3+bodySize], binary.BigEndian, s); err != nil {
 		return nil, fmt.Errorf("%w: %s: %v", ErrCorrupt, path, err)
 	}
 	return s, nil

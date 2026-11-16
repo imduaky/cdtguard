@@ -26,12 +26,29 @@ func Interfaces() ([]string, error) {
 	}
 	var out []string
 	for _, e := range ents {
-		if e.Name() != "lo" {
+		if MonitoredInterface(e.Name()) {
 			out = append(out, e.Name())
 		}
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// MonitoredInterface reports whether an interface name is likely to represent
+// a physical or cloud NIC rather than a local, VPN, container, or bridge link.
+func MonitoredInterface(name string) bool {
+	if name == "lo" {
+		return false
+	}
+	for _, prefix := range []string{
+		"tailscale", "docker", "br-", "veth", "tun", "tap", "wg",
+		"cni", "flannel", "virbr", "podman", "zt", "lima",
+	} {
+		if strings.HasPrefix(name, prefix) {
+			return false
+		}
+	}
+	return true
 }
 
 // Counters returns the cumulative rx/tx byte counters since boot.

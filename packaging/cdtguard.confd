@@ -1,3 +1,0 @@
-# Flags for `cdtguard run` (see `cdtguard run -h`).
-# Example: command_args="run -iface eth0 -limit 180G -cmd poweroff"
-command_args="run -limit 195G"

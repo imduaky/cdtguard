@@ -60,7 +60,14 @@ Alpine kernels have them; some minimal cloud kernels don't — check with `modpr
 
 ## 2. Run cdtguard with the hooks
 
-Commands contain spaces, so override `ExecStart` instead of using `/etc/default/cdtguard`:
+Initialize the desired limit and interface once (the default limit and mode
+are saved by `init`):
+
+```bash
+sudo cdtguard init 20G --limit 190G -iface eth0 -mode max
+```
+
+Commands contain spaces, so override `ExecStart` to add the run hooks:
 
 ```bash
 sudo systemctl edit cdtguard
@@ -68,7 +75,7 @@ sudo systemctl edit cdtguard
 ```ini
 [Service]
 ExecStart=
-ExecStart=/usr/bin/cdtguard run -limit 190G \
+ExecStart=/usr/bin/cdtguard run \
   -cmd "/usr/local/bin/cdtguard-throttle on" \
   -restore-cmd "/usr/local/bin/cdtguard-throttle on" \
   -reset-cmd "/usr/local/bin/cdtguard-throttle off"
@@ -77,9 +84,9 @@ ExecStart=/usr/bin/cdtguard run -limit 190G \
 sudo systemctl restart cdtguard
 ```
 
-Alpine (OpenRC), `/etc/conf.d/cdtguard`:
+Alpine (OpenRC), add the run hooks to `/etc/init.d/cdtguard`'s `command_args`:
 ```sh
-command_args="run -limit 190G -cmd '/usr/local/bin/cdtguard-throttle on' -restore-cmd '/usr/local/bin/cdtguard-throttle on' -reset-cmd '/usr/local/bin/cdtguard-throttle off'"
+command_args="run -cmd '/usr/local/bin/cdtguard-throttle on' -restore-cmd '/usr/local/bin/cdtguard-throttle on' -reset-cmd '/usr/local/bin/cdtguard-throttle off'"
 ```
 
 ## Caveats

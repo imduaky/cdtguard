@@ -15,6 +15,7 @@ func TestRoundTrip(t *testing.T) {
 	want.Daily[31] = Traffic{9, 10}
 	want.Hourly[47] = Traffic{11, 12}
 	want.History[11] = Cycle{Start: 13, Traffic: Traffic{14, 15}, FiredAt: 16}
+	want.SetConfig(195<<30, "max", "ens2")
 	if err := Save(p, want); err != nil {
 		t.Fatal(err)
 	}
@@ -28,19 +29,12 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
-func TestLoadsVersion1File(t *testing.T) {
-	b := make([]byte, legacySize)
-	copy(b, "CG\x01")
-	for i := range 7 {
-		binary.BigEndian.PutUint64(b[3+8*i:], uint64(i+1))
-	}
-	binary.BigEndian.PutUint32(b[59:], crc32.ChecksumIEEE(b[:59]))
-	p := filepath.Join(t.TempDir(), "s.bin")
-	os.WriteFile(p, b, 0o644)
-	got, err := Load(p)
-	want := State{PeriodStart: 1, SavedAt: 2, Rx: 3, Tx: 4, LastRx: 5, LastTx: 6, FiredAt: 7}
-	if err != nil || *got != want {
-		t.Fatalf("got %+v, %v", got, err)
+func TestConfig(t *testing.T) {
+	var s State
+	s.SetConfig(195<<30, "total", "enp1s0")
+	limit, mode, iface := s.Config()
+	if limit != 195<<30 || mode != "total" || iface != "enp1s0" {
+		t.Fatalf("config = %d %q %q", limit, mode, iface)
 	}
 }
 
@@ -51,6 +45,15 @@ func TestMissingAndCorrupt(t *testing.T) {
 	}
 	Save(p, &State{Rx: 9})
 	b, _ := os.ReadFile(p)
+	b[2] = 2 // unsupported state format version
+	binary.BigEndian.PutUint32(b[len(b)-4:], crc32.ChecksumIEEE(b[:len(b)-4]))
+	if err := os.WriteFile(p, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); !errors.Is(err, ErrCorrupt) {
+		t.Errorf("unsupported version: want corrupt, got %v", err)
+	}
+	b, _ = os.ReadFile(p)
 	for _, i := range []int{20, len(b) - 10} { // a field, then the padding
 		c := append([]byte(nil), b...)
 		c[i] ^= 0xff
