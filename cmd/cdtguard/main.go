@@ -92,7 +92,7 @@ func main() {
 func runCmd(args []string) {
 	var c common
 	fs := newFlags("run", &c)
-	command := fs.String("cmd", "shutdown now", "shell command to run when the limit is reached")
+	command := fs.String("cmd", "", "required shell command to run when the limit is reached")
 	restore := fs.String("restore-cmd", "", "run at startup after firing this cycle; reapply state lost on reboot (e.g. traffic shaping)")
 	reset := fs.String("reset-cmd", "", "run at the next cycle after firing; undo a reversible action (e.g. lift traffic shaping)")
 	interval := fs.Duration("interval", time.Minute, "traffic sampling interval")
@@ -115,6 +115,9 @@ Safe test example (initialize a low limit and test state with cdtguard init firs
     -cmd 'printf reached > /tmp/cdtguard-reached'`)
 	}
 	fs.Parse(args)
+	if strings.TrimSpace(*command) == "" {
+		log.Fatal("-cmd is required (set it in the service environment file or pass it to cdtguard run)")
+	}
 	if *interval < time.Second {
 		log.Fatal("-interval must be at least 1s")
 	}

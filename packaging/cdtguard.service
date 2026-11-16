@@ -3,7 +3,8 @@ Description=CDTGuard - monthly traffic guard
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/cdtguard run
+EnvironmentFile=-/etc/default/cdtguard
+ExecStart=/usr/bin/cdtguard run $CDTGUARD_ARGS
 Restart=on-failure
 RestartPreventExitStatus=2
 RestartSec=10
