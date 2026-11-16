@@ -46,6 +46,8 @@ interval = "1m"
 cdtguard status
 ```
 
+状态中的 `initial baseline` 是初始化 state 时已经存在、无法归属到具体日期的流量，不代表丢失统计；`used` 会将它和之后 daemon 运行期间采集的每日增量相加。初始化后 daemon 停止期间产生的流量，要等下一次 `run` 采样后才会写入 state。
+
 默认达到限额时执行 TOML 中的 `cmd`，每分钟采样一次。命令行选项和限速等高级示例见：
 
 ```bash

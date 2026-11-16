@@ -338,9 +338,9 @@ func printDaily(st *state.State) {
 		sum.Add(d.Rx, d.Tx)
 		row(start.AddDate(0, 0, i).Format("01-02 Mon"), d.Rx, d.Tx)
 	}
-	// Counted before per-day tracking began (NIC counters at first start, `init`, older version).
+	// Counted before per-day tracking began (NIC counters at init or an older state).
 	if rx, tx := st.Rx-min(sum.Rx, st.Rx), st.Tx-min(sum.Tx, st.Tx); rx|tx != 0 {
-		row("untracked", rx, tx, "(no per-day data)")
+		row("initial baseline", rx, tx, "(day unknown)")
 	}
 }
 
